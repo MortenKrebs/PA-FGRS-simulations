@@ -1,0 +1,1175 @@
+---
+title: "Estimating genetic liability from family history"
+author: "Morten Dybdahl Krebs"
+date: "14 2 2024"
+output: 
+  pdf_document: 
+    keep_tex:  true
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(message = F)
+```
+
+
+
+```{r load_functions, include=F}
+rm(list = ls())
+
+library(FamAgg)
+library(knitr)
+library(ggplot2)
+library(gridExtra)
+library(devtools)
+library(dplyr) 
+library(data.table)
+
+
+```
+```{r,eval=F}
+# Load the a script that allows us to compare to the Gibbs sampler 
+setwd("~/EBV/EBV_functions/")
+source("gibbs_campbell.R")
+
+# Load our PA-FGRS r-package (https://github.com/BioPsyk/PAFGRS)
+setwd("~/")
+load_all("PAFGRS")
+
+# Load LTPA from Hujoel et al:
+setwd("~/Downloads/software v2/")
+source("assign_ltpa.R")
+
+setwd("~/Methods_MDD_sims240212/")
+
+source("BLUPF90_from_R.R")
+library(LTFHPlus)
+```
+
+
+In our simulations all individuals will have the same structure of their pedigree, just with varying missingness. Therefore, we can write some simplified functions for calling the different liability estimator functions: 
+```{r wrapper}
+
+pa_fgrs_df <- function(df, stat_cols=which(grepl("stat",colnames(df))) ,
+                       age_cols=which(grepl("age",colnames(df))) ,
+                       rel_mat,h2, prev, aoo,ped,norm_weights=T){ 
+  data.frame(Reduce('rbind',lapply(1:nrow(df), function(y){
+    age= df[y,age_cols]
+    status= df[y,stat_cols]
+    w = sapply(age,aoo)
+    thr = rep(qnorm(1-prev),length(status))
+    covmatrix= rel_mat*h2
+    diag(covmatrix) = 1
+    covmatrix[1,1] = h2
+    PAFGRS::pa_fgrs(status,rel_thr = thr,rel_w = w,covmat = covmatrix)
+  })))
+}
+pa_fgrs_adt_df <- function(df, stat_cols=which(grepl("stat",colnames(df))) ,
+                           age_cols=which(grepl("age",colnames(df))) ,
+                           rel_mat,h2, prev, aoo,ped,norm_weights=T){ 
+  data.frame(Reduce('rbind',lapply(1:nrow(df), function(y){
+    age= df[y,age_cols]
+    status= df[y,stat_cols]
+    w = sapply(age,aoo)
+    thr = qnorm(1-prev*w)
+    covmatrix= rel_mat*h2
+    diag(covmatrix) = 1
+    covmatrix[1,1] = h2
+    PAFGRS::pa_fgrs(status,rel_thr = thr,rel_w = rep(1,length(status)),covmat = covmatrix)
+  })))
+}
+
+gibbs_df <- function(df, stat_cols=which(grepl("stat",colnames(df))) ,
+                     age_cols=which(grepl("age",colnames(df))) ,
+                     rel_mat,h2, prev, aoo){ 
+  data.frame(Reduce('rbind',lapply(1:nrow(df), function(y){
+    age= unlist(df[y,age_cols])
+    status= unlist(df[y,stat_cols])
+    w = sapply(age,aoo)
+    thr = rep(qnorm(1-prev),length(status))
+    covmatrix= rel_mat*h2
+    diag(covmatrix) = 1
+    covmatrix[1,1] = h2
+    gibbs(status,rel_thr = thr,rel_w = w,covmat = covmatrix,i_status = NA,i_thr = NA,i_w=0,useCpp=T,iter=30000)
+  })))
+}
+
+PA_df <- function(df, stat_cols=which(grepl("stat",colnames(df))) ,
+                  age_cols=which(grepl("age",colnames(df))) , 
+                  rel_mat,h2, prev, aoo,ped){ 
+  data.frame(Reduce('rbind',lapply(1:nrow(df), function(y){
+    status= df[y,stat_cols]
+    thr <- rep(qnorm(1-prev),length(status))
+    covmatrix= rel_mat*h2
+    diag(covmatrix) <- 1
+    covmatrix[1,1] = h2
+    PAFGRS::pa_fgrs(status,rel_thr = thr,rel_w=rep(1,length(status)),
+                    covmat = covmatrix)
+  })))
+}
+LTPA_df <- function(df,father_col,mother_col,sib_cols,h2) {
+  dfx <- df
+  dfx$IID <- 1:nrow(dfx)
+  dfx$ch_stat <- NA
+  dfx$p1_stat <-df[,mother_col]
+  dfx$p2_stat <- df[,father_col]
+  dfx$s_stat <- apply(df[,sib_cols,drop=F],1,any,na.rm = T)
+  dfx$n_sib <- length(sib_id) -rowSums(t(apply(df[,sib_cols,drop=F],1,is.na)))
+  dfx$s_stat[dfx$n_sib ==0]  <- NA
+  
+  pheno <- create_ltpa_pheno(data=dfx,trait_h2 = .5,
+                             T_val_child = qnorm(1-mean(unlist(df[,sib_cols])
+                                                        ,na.rm=T)),
+                             T_val_parent = qnorm(1-mean(c(dfx$p2_stat,dfx$p1_stat),
+                                                         na.rm=T)),
+                             relevant_trait_child = "ch_stat",
+                             relevant_trait_dad = "p1_stat",
+                             relevant_trait_mom = "p2_stat",
+                             relevant_trait_sib = "s_stat", 
+                             number_siblings_col = "n_sib",
+                             maximum_siblings_to_compute = length(sib_cols))
+  return(pheno[,"ltpa"])
+}
+
+LTFHPlus_df <- function(df,father_col,mother_col,sib_cols,father_age_col,mother_age_col,sib_age_cols,h2,aoo,prev) {
+  #mother_col=20;father_col=21;sib_cols=23:24;father_age_col=3;mother_age_col=4;sib_age_cols=5:6
+  dfx <-  data.table(fam_ID=as.character( 1:nrow(df)))
+  dfx$f <-df[,mother_col]
+  dfx$m <- df[,father_col]
+  dfx <- cbind(dfx,setnames(df[,sib_cols],new = paste0("s",1:length(sib_cols))))
+  dfx$f_a <-df[,mother_age_col]
+  dfx$m_a <- df[,father_age_col]
+  dfx <- cbind(dfx,setnames(df[,sib_age_cols],new = paste0("a_",1:length(sib_age_cols))))
+  input <- cbind(melt(dfx[,c("fam_ID","f","m",colnames(dfx)[grep("s",colnames(dfx))]),with=F],id.vars = "fam_ID",
+                      value.name = "status",variable.name = "role"),
+                 melt(dfx[,c("fam_ID","f_a","m_a",colnames(dfx)[grep("a_",colnames(dfx))]),with=F],id.vars = "fam_ID",value.name = "a")[,-(1:2)])
+  input[,t:=qnorm(1-aoo(a)*prev)]
+  input[,lower:=ifelse(status==1,t,-Inf)]
+  input[is.na(lower),lower:=-Inf]
+  input[,upper:=t]
+  input <- input[!(upper==Inf&lower==-Inf)]  
+  input[,PID:=as.character(1:nrow(input))]
+  input[,role:=as.character(role)]
+  liab <- estimate_liability(.tbl=tibble(input[!is.na(status)]),h2=h2,out=c(1),tol=0.01)
+  data.table(liab)[input[,.(fam_ID=unique(fam_ID))],on="fam_ID"]
+}
+# gibbsF90 on df:
+
+
+gibbsF90_df <- function(df, stat_cols=which(grepl("stat",colnames(df))) ,
+                        age_cols=which(grepl("age",colnames(df))) , 
+                        h2, aoo,ped){
+  ped_i <- ped
+  ids= unique(unlist(c(ped$id,ped$fatherid,ped$motherid)))
+  ids <- ids[-which(ids==0)] 
+  ped_i$id_i <- match(ped$id,ids)
+  ped_i$motherid_i <- match(ped$motherid,ids)
+  ped_i$fatherid_i <- match(ped$fatherid,ids)
+  ped_i <- ped_i[,c("id_i","motherid_i","fatherid_i")]
+  ped_i[is.na(ped_i)] <- 0
+  data.frame(Reduce('rbind',lapply(1:nrow(df), function(y){
+    status= df[y,stat_cols]
+    status[is.na(status)] <- -1
+    run_f90(data=data.frame(unlist(c(0,status+1)),unique(ped_i$id_i),rep(1,1+length(status))),path_to_BLUPF90="~/gibbsf90+",
+            path_to_binsol=NA,ped=ped_i,h2=.5,PED_DEPTH=8,
+            n_covariates=1,posPheno=1,posID=2,posCovs=3,typeCovs="cross",iter=20000,burnin=10000)[2,4]
+  })))
+}
+
+
+gibbsF90_df_full <- function(df, stat_cols=which(grepl("stat",colnames(df))) ,
+                             age_cols=which(grepl("age",colnames(df))) , 
+                             h2, aoo,ped,iter,burnin){
+  ped_all <- Reduce('rbind',lapply(1:nrow(df),function(x){ 
+    data.table(
+      id=paste(rep(x,nrow(ped)),ped$id,sep = "_"),
+      motherid=paste(rep(x,nrow(ped)),ped$motherid,sep = "_"),
+      fatherid=paste(rep(x,nrow(ped)),ped$fatherid,sep = "_"))}))
+  ped_i <- ped_all
+  ids= unique(unlist(c(ped_all$id,ped_all$fatherid,ped_all$motherid)))
+  ids <- ids[!grepl("_0",ids)] 
+  ped_i$id_i <- match(ped_all$id,ids)
+  ped_i$motherid_i <- match(ped_all$motherid,ids)
+  ped_i$fatherid_i <- match(ped_all$fatherid,ids)
+  ped_i <- ped_i[,c("id_i","motherid_i","fatherid_i")]
+  ped_i[is.na(ped_i)] <- 0
+  status= c(t(cbind(rep(NA,nrow(df)),df[,stat_cols])))
+  status[is.na(status)] <- -1
+  run_f90(data=data.frame(unlist(c(status+1)),unique(ped_i$id_i),rep(1,length(status))),path_to_BLUPF90="~/gibbsf90+",
+          path_to_binsol=NA,ped=ped_i,h2=.5,PED_DEPTH=8,
+          n_covariates=1,posPheno=1,posID=2,posCovs=3,typeCovs="cross",iter=iter,burnin=burnin)[seq(2,length(status),length(status)/nrow(df)),4]
+}
+
+
+```
+
+We base our simulations on this pedigree with 18 relatives: 
+```{r pedigree, include=F}
+data("minnbreast")
+# we get a pedigree of 28 people:
+ped <- minnbreast[minnbreast$famid==600,]
+
+ped <- ped[c(which(ped$id==25932),which(ped$id!=25932)),] 
+ped <-ped[!ped$id %in% 25934:25936,]
+
+ped <- ped[ped$id %in% ped$motherid |ped$id %in% ped$fatherid | ped$fatherid!=0 ,]
+
+
+fatherid = ped[ped[,"id"] %in% ped[1,"fatherid"],"id"]
+motherid = ped[ped[,"id"] %in% ped[1,"motherid"],"id"]
+sib_id = unique(c(ped[ped[,"fatherid"] %in% ped[1,"fatherid"],"id"], ped[ped[,"motherid"] %in% ped[1,"motherid"],"id"]))
+sib_id <- sib_id[!sib_id ==25932]
+
+depth<- kinship2::kindepth(kinship2::pedigree(ped$id, dadid =ped$fatherid ,momid =ped$motherid,sex = ped$sex),align = T)
+
+gen_back = abs(depth-depth[1])
+
+```
+
+```{r ,echo=F, warning=F,message=FALSE}
+plot(kinship2::pedigree(ped$id, dadid =ped$fatherid ,momid =ped$motherid,sex = ped$sex, affected = c(NA,rep(0,18))))
+```
+
+### Covariance in liability
+From this pedigree we specify a covariance matrix given a heritability (e.g. if $h^2=0.5$): 
+  
+```{r}
+h2 = .5
+r <- kinship2::kinship(ped$id, dadid =ped$fatherid ,momid =ped$motherid)*2
+
+covmatrix= r*h2
+diag(covmatrix) <- 1
+covmatrix[1,1] = h2
+
+covmatrix[1:5,1:5]
+```
+
+
+### Disease status in relatives
+We draw liabilities from a multivarite normal distribution. We the draw $N$ probands with accompanying relatives and turn the liabilities into lifetime disease status by a threshold function and into observed disease with a probability corresponding the proportion of risk expressed at their age at end of follow-up.    
+
+```{r aoo}
+
+ped$age <- sapply(gen_back,
+                  function(x) if(x>1)  runif(1,60,100)  else 
+                    if(x==1) runif(1,40,70)   else
+                      runif(1,10,40))
+
+aoo_no_cens <- function(age) { 
+  pr <- rep(1,length(age))
+  pr}  
+aoo_cens <- function(age) { 
+  pr <- (age-20)/45
+  pr[pr>1] <- 1
+  pr[pr<0] <- 0
+  pr}  
+
+par(mfrow=c(1,2))
+plot(1:100,sapply(1:100,aoo_no_cens),type = "l",main = "Not censored",
+     xlab = "age",ylab = "propotion of lifetime-cases expressing the phenotype")
+
+plot(1:100,sapply(1:100,aoo_cens),type = "l",main = "Censored",
+     xlab = "age",ylab = "")
+```
+
+```{r, include=F}
+par(mfrow=c(1,1))  
+rel_mat <- r 
+```
+
+
+
+```{r simulator, include=T}
+##### Simulator function #####
+
+sim <- function(N,covmatrix,thr,prop_obs=.5,FU,aoo_l_cor,ped){
+  
+  # draw from mvnorm distribution:
+  df <- MASS::mvrnorm(N,mu =rep(0,nrow(covmatrix)),covmatrix)
+  
+  # introduce varying family structure:
+  df[sample((N+1):(N*nrow(covmatrix)),N*nrow(covmatrix)*prop_obs,replace = F)] <- NA
+  df <- data.frame(df) 
+  colnames(df) <- paste0("z",1:nrow(covmatrix))
+  
+  if(FU=="incomplete")
+  age <- t(matrix(ped$age[-1],nrow(covmatrix)-1,N)) +
+    matrix(runif(N*(nrow(covmatrix)-1),-5,5),N,nrow(covmatrix)-1) else
+      age <- matrix(100,N,nrow(covmatrix)-1)
+  
+  # Lifetime disease status 
+  status <- t(apply(df[,2:nrow(covmatrix)], 1, function(x) as.numeric(x>thr)))
+  
+  # AOO
+  h=t(apply(df[,2:nrow(covmatrix)], 1,function(x) -aoo_l_cor*x+sqrt(1-aoo_l_cor^2)*rnorm(length(x))))
+  onset_age <- h*sqrt(35+20*aoo_l_cor)+40+12*aoo_l_cor
+  
+  # status is 0 if AOO>age
+  status[onset_age>age] <- 0
+  
+  age[!is.na(status)&status==1] <- onset_age[!is.na(status)&status==1] 
+  
+  colnames(age) <- colnames(status) <- colnames(df)[-1]
+  
+  # Dataframe with true liabilities, status and age:
+  cbind(df,status=status,age=age)
+}
+
+covmatrix= r*h2
+  diag(covmatrix) <- 1
+  covmatrix[1,1] = h2
+
+sim_test <- data.table(sim(100000,covmatrix,qnorm(1-.2),FU = "comp",aoo_l_cor = 1,ped = ped))
+aoo1_k0.2 <- sim_test[status.z10==1,.N,round(age.z10)][order(round),.(round,cumsum(N)/sim_test[status.z10==1,.N,])]
+
+
+sim_test <- data.table(sim(100000,covmatrix,qnorm(1-.2),FU = "comp",aoo_l_cor = .5,ped = ped))
+aoo5_k0.2 <- sim_test[status.z10==1,.N,round(age.z10)][order(round),.(round,cumsum(N)/sim_test[status.z10==1,.N,])]
+
+
+sim_test <- data.table(sim(100000,covmatrix,qnorm(1-.2),FU = "comp",aoo_l_cor = 0,ped = ped))
+aoo0 <- aoo0_k0.2 <- sim_test[status.z10==1,.N,round(age.z10)][order(round),.(round,cumsum(N)/sim_test[status.z10==1,.N,])]
+
+
+aoo_gen <- function(aoo_table){ approxfun(c(0,aoo_table[,1],Inf),c(0,aoo_table[,2],1)) }
+
+```
+
+
+```{r,eval=F}
+# Under our simulation framework, the AOO distribution will shift left when the trait becomes rare if the liability and AOO distibutions are correlated:
+aoo1_prevs <- Reduce('rbind',lapply(seq(0.01,.25,length.out=7), function(prev){
+sim_test <- data.table(sim(100000,covmatrix,qnorm(1-prev),FU = "comp",aoo_l_cor = 1,ped = ped))
+data.table(prev,sim_test[status.z10==1,.N,round(age.z10)][order(round),.(round,cumsum(N)/sim_test[status.z10==1,.N,])])}))
+qplot(data=aoo1_prevs,x=round,y=V2,color=factor(prev))+geom_line()
+
+aoo0_prevs <- Reduce('rbind',lapply(seq(0.01,.25,length.out=7), function(prev){
+sim_test <- data.table(sim(100000,covmatrix,qnorm(1-prev),FU = "comp",aoo_l_cor = 0,ped = ped))
+data.table(prev,sim_test[status.z10==1,.N,round(age.z10)][order(round),.(round,cumsum(N)/sim_test[status.z10==1,.N,])])}))
+qplot(data=aoo0_prevs,x=round,y=V2,color=factor(prev))+geom_line()
+```
+
+# Esimated liabilities:
+We compare the following methods for estimating the liabilities based on the family history: 
+  
+  * LTPA (Hujoel et al, 2020)
+* FGRS (Kendler et al, 2021)
+* Gibbs (Campbell et al et al, 2017)
+* PA (Similar to So et al, 2011)
+* PA-FGRS (our method)
+
+## Correlation of estimated liabilities
+
+```{r run_sim,echo=T,warning=F,include=T}
+run_sim <- function(N,ped,rel_mat,h2,aoo_l_cor,aoo_table,prev,prop_obs=.5,FU,fatherid,motherid,sib_id){
+  
+  aoo <- aoo_gen(data.frame(aoo_table))
+  covmatrix= r*h2
+  diag(covmatrix) <- 1
+  covmatrix[1,1] = h2
+  thr=qnorm(1-prev)
+  
+  df <- sim(N,covmatrix,thr,prop_obs=.5,FU,aoo_l_cor,ped)
+  
+  fgrs_out <- FGRS(df = df, rel_mat = rel_mat,
+                     prev = prev,aoo = aoo,env_cor = 1) 
+    
+  pa_fgrs_out <- pa_fgrs_df(df = df, rel_mat = rel_mat,h2=h2,
+                              prev = prev,aoo = aoo) 
+    
+  pa_fgrs_adt_out <- pa_fgrs_adt_df(df = df, rel_mat = rel_mat,h2=h2,
+                                      prev = prev,aoo = aoo) 
+    
+  pa_out <- PA_df(df = df, rel_mat = rel_mat,
+                    prev = prev,h2=h2,aoo = aoo) 
+    
+  gibbsF90_out_full <- gibbsF90_df_full(df = df, 
+                                          ped = ped,h2=h2,iter=30000,burnin=10000) 
+  gibbs_out <- gibbs_df(df = df, rel_mat = rel_mat,h2=h2,
+                          prev = prev,aoo = aoo)
+    
+  ltpa_out <- LTPA_df(df=df, 
+                        father_col = which(colnames(df) %in% 
+                                             paste0("status.z",which(ped$id %in% fatherid))),
+                        mother_col = which(colnames(df) %in% 
+                                             paste0("status.z",which(ped$id %in% motherid))),
+                        sib_cols = which(colnames(df) %in% 
+                                           paste0("status.z",which(ped$id %in% sib_id))))
+    
+  ltfhpp_out <- LTFHPlus_df(df=df, 
+                              father_col = which(colnames(df) %in% 
+                                                   paste0("status.z",which(ped$id %in% fatherid))),
+                              mother_col = which(colnames(df) %in% 
+                                                   paste0("status.z",which(ped$id %in% motherid))),
+                              sib_cols = which(colnames(df) %in% 
+                                                 paste0("status.z",which(ped$id %in% sib_id))),
+                              father_age_col = which(colnames(df) %in% 
+                                                       paste0("age.z",which(ped$id %in% fatherid))),
+                              mother_age_col = which(colnames(df) %in% 
+                                                       paste0("age.z",which(ped$id %in% motherid))),
+                              sib_age_cols = which(colnames(df) %in% 
+                                                     paste0("age.z",which(ped$id %in%
+                                                                           sib_id))),
+                              aoo=aoo,h2=h2,prev=prev)
+    
+    
+  cbind(true_liab=df,
+        fgrs=fgrs_out,
+        pa_fgrs=pa_fgrs_out[,1],
+        pa_fgrs_adt=pa_fgrs_adt_out[,1],
+        pa= pa_out[,1],
+        ltpa=ltpa_out,
+        gibbs=gibbs_out[,1],
+        ltfhpp=ltfhpp_out$genetic_est,
+        gibbsF90=gibbsF90_out_full)
+  }
+
+```
+
+
+```{r simulations,eval=T,echo=T, results=F, fig.height=3,fig.width=3}
+for(FU in c("complete","incomplete")){
+for(i in 1:3){
+  model=c("aoo1","aoo0","aoo5")[i]
+  aoo_l_cor=c(1,0,.5)[i]
+  aoo_table=list(aoo1_k0.2,aoo0_k0.2,aoo5_k0.2)[[i]]
+if(!file.exists(paste0("~/Methods_MDD_sims240212/tmp/model_",model,"_FU",FU,"240221.Rdata"))) {
+  set.seed(123)
+  
+   Sims <- parallel::mclapply(mc.cores = 25,1:100,
+                      function(x) run_sim(N=500,ped=ped,rel_mat=r,
+   # Sims <- parallel::mclapply(mc.cores = 5,1:5,
+   #                   function(x) run_sim(N=5,ped=ped,rel_mat=r,
+                                         h2=0.5,aoo_l_cor=aoo_l_cor,
+                                         aoo_table=aoo_table,
+                                         prev=0.2,prop_obs=.5,FU=FU,
+                                         fatherid=fatherid,
+                                         motherid=motherid,sib_id=sib_id))
+  save(file = paste0("~/Methods_MDD_sims240212/tmp/model_",model,"_FU",FU,"240221.Rdata"),Sims)
+}}}
+
+
+for(prev in seq(.01,.25,length.out=7)){
+  aoo_l_cor=0
+  aoo_table=aoo0
+  FU="incomplete"
+if(!file.exists(paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,".Rdata"))) {
+  set.seed(123)
+  Sims <- parallel::mclapply(mc.cores = 50,1:50,
+                     function(x) run_sim(N=2500,ped=ped,rel_mat=r,
+                                         h2=0.5,aoo_l_cor=aoo_l_cor,
+                                         aoo_table=aoo_table,
+                                         prev=prev,prop_obs=.5,FU=FU,
+                                         fatherid=fatherid,
+                                         motherid=motherid,sib_id=sib_id))
+  save(file = paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,".Rdata"),Sims)
+}
+  
+if(!file.exists(paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,"_adt.Rdata"))) {
+  sim_test <- data.table(sim(100000,covmatrix,qnorm(1-prev),FU = "comp",
+                             aoo_l_cor = 1,ped = ped))
+
+  aoo1 <-  sim_test[status.z10==1,
+                  .N,round(age.z10)][order(round),
+                                     .(round,cumsum(N)/
+                                         sim_test[status.z10==1,.N,])]
+
+  aoo_l_cor=1
+  aoo_table=aoo1
+  set.seed(123)
+  Sims <- parallel::mclapply(mc.cores = 50,1:50,
+                     function(x) run_sim(N=2500,ped=ped,rel_mat=r,
+                                         h2=0.5,aoo_l_cor=aoo_l_cor,
+                                         aoo_table=aoo_table,
+                                         prev=prev,prop_obs=.5,FU=FU,
+                                         fatherid=fatherid,
+                                         motherid=motherid,sib_id=sib_id))
+  save(file = paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,"_adt.Rdata"),Sims)
+}
+    }
+
+if(F){
+for(h2 in seq(.1,1,.1)){
+
+  aoo_l_cor=0
+  aoo_table=aoo0
+  FU="incomplete"
+if(!file.exists(paste0("~/Methods_MDD_sims240212/tmp/h2_",h2,".Rdata"))) {
+  set.seed(123)
+  Sims <- parallel::mclapply(mc.cores = 50,1:50,
+                     function(x) run_sim(N=1000,ped=ped,rel_mat=r,
+                                         h2=h2,aoo_l_cor=aoo_l_cor,
+                                         aoo_table=aoo_table,
+                                         prev=.2,prop_obs=.5,FU=FU,
+                                         fatherid=fatherid,
+                                         motherid=motherid,sib_id=sib_id))
+  save(file = paste0("~/Methods_MDD_sims240212/tmp/h2_",h2,".Rdata"),Sims)
+  }}  }
+
+
+```
+
+
+```{r, runtimes, eval=F }
+
+times = sapply((1:50)*2,function(n_sib) {
+cat(n_sib)
+n_gen=1
+N=20 
+ped=PAFGRS:::generate_pedigree(n_gen,child_pr_gen = 1+n_sib)
+r= with(ped,kinship2::kinship(id = id,momid=momid,dadid=dadid))*2
+print(ped)
+colnames(ped)[2:3] <- c("motherid","fatherid")
+print(ped)
+h2=.5
+prev=.2
+aoo_l_cor=0
+prop_obs=1
+FU="incomplete" 
+fatherid=2
+motherid=3
+sib_id= ped$id[ped$motherid==3&ped$fatherid==2][-1]
+ped$age= runif(nrow(ped),10,90)
+covmatrix= r*h2
+diag(covmatrix) <- 1
+covmatrix[1,1] = h2
+thr=qnorm(1-prev)
+sim_test <- data.table(sim(N = 100000,covmatrix = covmatrix,thr = qnorm(1-.2),FU = "comp",aoo_l_cor = 0,ped = ped,prop_obs = 0))
+aoo0 <- sim_test[status.z2==1,.N,round(age.z2)][order(round),.(round,cumsum(N)/sim_test[status.z2==1,.N,])]
+aoo <- aoo_gen(data.frame(aoo0))
+  
+  df <- sim(N,covmatrix,thr,prop_obs=0,FU,aoo_l_cor,ped)
+  
+  fgrs_out <- system.time(FGRS(df = df, rel_mat = r,
+                     prev = prev,aoo = aoo,env_cor = 1)) 
+    
+  pa_fgrs_out <- system.time(pa_fgrs_df(df = df, rel_mat = r,h2=h2,
+                              prev = prev,aoo = aoo)) 
+    
+  pa_fgrs_adt_out <- system.time(pa_fgrs_adt_df(df = df, rel_mat =r,h2=h2,
+                                      prev = prev,aoo = aoo)) 
+    
+  pa_out <- system.time(PA_df(df = df, rel_mat = r,
+                    prev = prev,h2=h2,aoo = aoo)) 
+    
+cat("starting gibbsF90... \n")     
+    gibbsF90_out_full <- system.time(gibbsF90_df_full(df = df, 
+                                          ped = ped,h2=h2,iter=30000,burnin=10000)) 
+cat("starting gibbs... \n")     
+    gibbs_out <- system.time(gibbs_df(df = df, rel_mat = r,h2=h2,
+                          prev = prev,aoo = aoo))
+cat("starting LTPA... \n")    
+  ltpa_out <- system.time(LTPA_df(df=df, 
+                        father_col = which(colnames(df) %in% 
+                                             paste0("status.z",which(ped$id %in% fatherid))),
+                        mother_col = which(colnames(df) %in% 
+                                             paste0("status.z",which(ped$id %in% motherid))),
+                        sib_cols = which(colnames(df) %in% 
+                                           paste0("status.z",which(ped$id %in% sib_id)))))
+cat("starting LTFH++... \n")      
+  ltfhpp_out <- system.time(LTFHPlus_df(df=df, 
+                              father_col = which(colnames(df) %in% 
+                                                   paste0("status.z",which(ped$id %in% fatherid))),
+                              mother_col = which(colnames(df) %in% 
+                                                   paste0("status.z",which(ped$id %in% motherid))),
+                              sib_cols = which(colnames(df) %in% 
+                                                 paste0("status.z",which(ped$id %in% sib_id))),
+                              father_age_col = which(colnames(df) %in% 
+                                                       paste0("age.z",which(ped$id %in% fatherid))),
+                              mother_age_col = which(colnames(df) %in% 
+                                                       paste0("age.z",which(ped$id %in% motherid))),
+                              sib_age_cols = which(colnames(df) %in% 
+                                                     paste0("age.z",which(ped$id %in%
+                                                                           sib_id))),
+                              aoo=aoo,h2=h2,prev=prev))
+cat("Done \n")    
+    
+  c(n_sib=n_sib,N_ped=N,fgrs=fgrs_out[3],
+        pa_fgrs=pa_fgrs_out[3],
+        pa_fgrs_adt=pa_fgrs_adt_out[3],
+        pa= pa_out[3],
+        ltpa=ltpa_out[3],
+        gibbs=gibbs_out[3],
+        ltfhpp=ltfhpp_out[3],
+        gibbsF90=gibbsF90_out_full[3])
+  })
+
+save(times,file = "~/Methods_MDD_sims240212/tmp/runtimes.Rdata")
+```
+
+```{r plot_runtimes,fig.height=4,fig.width=6}
+load("~/Methods_MDD_sims240212/tmp/runtimes.Rdata")
+dt = melt(data.table(t(times)),id.vars=c("n_sib","N_ped"))
+dt[,variable:=sub(".elapsed","",variable)]
+dt[variable=="fgrs",method:="FGRS"]
+g <- ggplot(dt,
+            aes(x=n_sib+2,y=value/10, color=variable))+
+  geom_point()+
+  labs(x=expression(N[relatives]),y= "Runtime (s/pedigree)",color="Method")+
+  theme_bw()+  
+  facet_wrap(~ifelse(variable %in% c("gibbs","gibbsF90","ltfhpp"),
+                     "Sampling","Analytical"),scales="free")+
+  expand_limits(ymin=0)+
+  scale_color_manual(values=c("fgrs"="#000000", "ltpa"="#E69F00", 
+                              "pa"="#56B4E9","pa_fgrs"= "#009E73",
+                              "pa_fgrs_adt"="lightgreen","gibbs"="red",
+                              "gibbsF90"="gray","ltfhpp"="purple"),
+                      label=c("pa_fgrs_adt"=bquote("PA-FGRS"[adt]),"fgrs"="FGRS",
+                              "ltfhpp"="LTFH++","pa"="PA","pa_fgrs"="PA-FGRS","ltpa"="LTPA"),
+                     breaks = c("pa_fgrs_adt","pa_fgrs",
+                                "pa","ltpa",
+                                "fgrs","gibbs","ltfhpp","gibbsF90"))+
+theme( panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(), 
+       strip.background = element_rect(fill="white",linetype = "solid"))
+g
+
+
+```
+
+
+```{r}
+source("~/PAFGRS_adt.R")
+pa_fgrs_adt2_df <- function(df, stat_cols=which(grepl("stat",colnames(df))) ,
+                           age_cols=which(grepl("age",colnames(df))) ,
+                           rel_mat,h2, prev, aoo,ped,norm_weights=T,nuclear_only=F){ 
+  data.frame(Reduce('rbind',lapply(1:nrow(df), function(y){
+    age= df[y,age_cols]
+    status= df[y,stat_cols]
+    w = sapply(age,aoo)
+    thr = qnorm(1-prev*w)
+    #thr[!is.na(status)&status==1] = df[y,2:19][!is.na(status)&status==1]
+    covmatrix= rel_mat*h2
+    diag(covmatrix) = 1
+    covmatrix[1,1] = h2
+    #pa_fgrs2(status,thr = qnorm(1-prev),rel_thr2 = rep(Inf,length(status)),rel_w = w,covmat = covmatrix)
+   # cols = which(colnames(df)[-1] %in% 
+  #  paste0("true_liab.z",which(ped$id %in% c(fatherid,motherid,sib_id))))
+  if(nuclear_only==T){
+  cols=c(4, 12, 13, 15)
+    
+    pa_fgrs2(status[cols],rel_thr = thr[cols],rel_thr2 = thr[cols],rel_w = rep(1,length(status))[cols],covmat = covmatrix[c(1,1+cols),c(1,1+cols)])               } else           
+   pa_fgrs2(status,rel_thr = thr,rel_thr2 = thr,rel_w = rep(1,length(status)),covmat = covmatrix)
+  })))
+}
+for(FU in c("complete","incomplete")){
+for(i in 1:3){
+aoo_l_cor=c(1,0,.5)[i]
+model=c("aoo1","aoo0","aoo5")[i]
+
+if(!file.exists(paste0("~/Methods_MDD_sims/tmp/model_",model,"_FU",FU,"240227.Rdata"))){
+
+  aoo_table=list(aoo1_k0.2,aoo0_k0.2,aoo5_k0.2)[[i]]
+  aoo <- aoo_gen(data.frame(aoo_table))
+  covmatrix= r*h2
+  diag(covmatrix) <- 1
+  covmatrix[1,1] = h2
+  thr=qnorm(1-prev)
+
+  sims_i <- get(load(paste0("~/Methods_MDD_sims/tmp/model_",model,
+                            "_FU",FU,"240221.Rdata")))    
+  unfailed <- sapply(sims_i, is.data.frame)
+  sims_ii <-lapply(sims_i[unfailed],function(df){
+  pa_fgrs_adt_out <- pa_fgrs_adt2_df(df = df[,1:55], rel_mat = rel_mat,h2=h2,
+                                      prev = .2,aoo = aoo) 
+  df=cbind(df,pa_fgrs_adt_new=pa_fgrs_adt_out$postM)})
+  save(sims_ii,file = paste0("~/Methods_MDD_sims/tmp/model_",model,
+                             "_FU",FU,"240227.Rdata"))
+  }
+}}
+
+for(prev in seq(.01,.25,length.out=7)){
+
+  aoo_l_cor=0
+  aoo_table=aoo0
+  FU="incomplete"
+if(!file.exists(paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,".240227.Rdata"))){
+
+  aoo <- aoo_gen(data.frame(aoo_table))
+  covmatrix= r*h2
+  diag(covmatrix) <- 1
+  covmatrix[1,1] = h2
+  thr=qnorm(1-prev)
+
+  sims_i <- get(load(paste0("~/Methods_MDD_sims240212/tmp/model_",model,
+                            "_FU",FU,"240221.Rdata")))    
+  unfailed <- sapply(sims_i, is.data.frame)
+  sims_ii <-lapply(sims_i[unfailed],function(df){
+  pa_fgrs_adt_out <- pa_fgrs_adt2_df(df = df[,1:55], rel_mat = rel_mat,h2=h2,
+                                      prev = .2,aoo = aoo) 
+  df=cbind(df,pa_fgrs_adt_new=pa_fgrs_adt_out$postM)})
+  save(sims_ii,file =  paste0("~/Methods_MDD_sims240212/tmp/prev_",
+                              prev,".240227.Rdata"))
+  }
+}
+
+
+for(prev in seq(.01,.25,length.out=7)){
+  aoo_l_cor=1
+  FU="incomplete"
+  sim_test <- data.table(sim(100000,covmatrix,qnorm(1-prev),FU = "comp",
+                             aoo_l_cor = 1,ped = ped))
+  aoo1 <-  sim_test[status.z10==1,
+                  .N,round(age.z10)][order(round),
+                                     .(round,cumsum(N)/
+                                         sim_test[status.z10==1,.N,])]
+
+if(!file.exists(paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,"_adt.240227.Rdata"))){
+
+  aoo <- aoo_gen(data.frame(aoo1))
+  covmatrix= r*h2
+  diag(covmatrix) <- 1
+  covmatrix[1,1] = h2
+  thr=qnorm(1-prev)
+
+  sims_i <- get(load(paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,
+                            "_adt.Rdata")))    
+  unfailed <- sapply(sims_i, is.data.frame)
+  sims_ii <-lapply(sims_i[unfailed],function(df){
+  pa_fgrs_adt_out <- pa_fgrs_adt2_df(df = df[,1:55], rel_mat = rel_mat,h2=h2,
+                                      prev = .2,aoo = aoo) 
+  df=cbind(df,pa_fgrs_adt_new=pa_fgrs_adt_out$postM)})
+  save(sims_ii,file =  paste0("~/Methods_MDD_sims240212/tmp/prev_",
+                              prev,"_adt.240227.Rdata"))
+  }
+}
+```
+
+
+
+```{r corrplot,fig.height=5,fig.width=12}
+library(corrplot)
+
+dt <-lapply(c("complete","incomplete"), function(FU) {  lapply(1:3, function(i){
+aoo_l_cor=c(1,0,.5)[i]
+model=c("aoo1","aoo0","aoo5")[i]
+sims_i <- get(load(paste0("~/Methods_MDD_sims/tmp/model_",model,"_FU",FU,"240227.Rdata")))  
+colnames(sims_i[[1]])
+library(abind)
+unfailed <- sapply(sims_i, is.data.frame)
+cors = lapply(sims_i[unfailed],function(x) cor(x[,c(56:57,59:64)],use="complete"))
+list(apply(do.call('abind',list(cors,along=3)),1:2,mean),
+se_cor = apply(do.call('abind',list(cors,along=3)),1:2,sd)/sqrt(length(cors)))
+})})
+par(mfrow=(c(1,2)))
+
+
+corr=dt[[1]][[2]][[1]] # Complete Random
+rownames(corr) <- colnames(corr) <- c("FGRS","PA-FGRS","PA","LTPA","gibbs","LTFH++","gibbsF90","$'PA-FGRS'['adt']")
+corrplot(corr,method = "number",number.digits = 3,diag = F,
+         col.lim = c(.7,1),
+         col =colorRampPalette(c(rep("#FFFFFF",20), "#67001F","#B2182B", 
+                                   "#2166AC", "#053061"))(500),
+         cl.pos = 'n',tl.col = "black",hclust.method = "ward.D2",
+         is.corr = T,order = "hclust",addrect = 3,parse=F)
+
+corr=dt[[2]][[2]][[1]] # Incomplete Random
+rownames(corr) <- colnames(corr) <- c("FGRS","PA-FGRS",
+                                      "PA","LTPA","gibbs","LTFH++","gibbsF90","$'PA-FGRS'['adt']")
+corrplot(corr,method = "number",number.digits = 3,diag = F,
+         col.lim = c(.7,1),
+         col =colorRampPalette(c(rep("#FFFFFF",20), "#67001F","#B2182B", 
+                                   "#2166AC", "#053061"))(500),
+         cl.pos = 'n',tl.col = "black",hclust.method = "ward.D2",
+         is.corr = T,order = "hclust",addrect = 3)
+```
+
+
+```{r corplot_leg,echo=T,eval=T,fig.width=5,fig.height=5}
+
+par(mar=rep(0,4))
+plot(0, xlim = c(-0.1, 1), ylim = c(0, 1), type = 'n',axes=F,xlab="",ylab="")
+col=colorRampPalette(c(rep("#FFFFFF",20), "#67001F","#B2182B", 
+                               "#2166AC", "#053061"))(1000)
+labels=seq(.8,1,.05)
+    colorlegend(colbar = col[(500+500*.8):1000], labels = round(labels, 
+      2), ratio.colbar = 0.3, cex = .8, offset=.5,
+      xlim = c(.42,.57), ylim = c(0,1), vertical = T, align = "c")
+
+```
+
+
+```{r corplot_adt,echo=T,eval=T,fig.width=6,fig.height=5}
+corr=dt[[2]][[1]][[1]] # Incomplete ADT
+rownames(corr) <- colnames(corr) <- c("FGRS","PA-FGRS","PA","LTPA","gibbs",
+                                      "LTFH++","gibbsF90","$'PA-FGRS'['adt']")
+corrplot(corr,method = "number",number.digits = 3,diag = F,
+         col.lim = c(.7,1),
+         col =colorRampPalette(c(rep("#FFFFFF",20), "#67001F","#B2182B", 
+                                   "#2166AC", "#053061"))(500),
+         cl.pos = 'r',tl.col = "black",hclust.method = "ward.D2",
+         is.corr = T,order = "hclust",addrect = 3)
+
+
+
+```
+
+
+
+```{r generative_models_main, fig.height=3,fig.width=4}
+h2=0.5
+dt <- Reduce('rbind',lapply(c("complete","incomplete"), function(FU) {  
+Reduce('rbind',lapply(1:3, function(i){
+aoo_l_cor=c(1,0,.5)[i]
+model=c("aoo1","aoo0","aoo5")[i]
+sims_i <- get(load(paste0("~/Methods_MDD_sims/tmp/model_",
+                          model,"_FU",FU,"240227.Rdata")))  
+colnames(sims_i[[1]])
+library(abind)
+unfailed <- sapply(sims_i, is.data.frame)
+cors = lapply(sims_i[unfailed],
+              function(x) cor(x[,c(1,56:57,59:64)],use="complete")^2*h2)
+m_cor = apply(do.call('abind',list(cors,along=3)),1:2,mean)
+
+se_cor = apply(do.call('abind',list(cors,along=3)),1:2,sd)/sqrt(length(cors))
+dt= data.table(rownames(m_cor)[-1],mean=m_cor[-1,1],se=se_cor[-1,1])
+dt$method = c("FGRS","PA-FGRS",
+              "PA","LTPA","gibbs","LTFH++","gibbsF90","PA-FGRS_adt")
+dt$aoo_l_cor <- aoo_l_cor
+dt$FU <- FU
+dt}))}))
+
+
+dt$method_f <- factor(dt$method,levels = c("PA-FGRS","gibbs",
+                                           "PA-FGRS_adt","PA","gibbsF90",
+                                           "FGRS","LTFH++","LTPA"))
+g <- ggplot(dt[FU=="incomplete"&aoo_l_cor%in%0:1&method!="gibbs"],
+            aes(x=method_f,y=mean, color=method))+
+  geom_point()+
+  geom_errorbar(aes(ymin=mean-1.96*se,ymax=mean+1.96*se),width=.01)+
+  labs(x="",y= expression(R[l]^2),color="Method")+
+  theme_bw()+ 
+   facet_wrap(~ifelse(aoo_l_cor==0,"Sim: Random AOO",
+                      ifelse(aoo_l_cor==0.5,"Sim: cor(AOO,Liability)=0.50",
+                             "Sim: Age-depend. thresh.")))+
+  expand_limits(ymin=0)+ 
+  scale_color_manual(values=c("FGRS"="#000000", "LTPA"="#E69F00", 
+                              "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                              "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                              "gibbsF90"="gray","LTFH++"="purple"),
+                     label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                     breaks = c("PA-FGRS","gibbs","PA-FGRS_adt","PA","gibbsF90",
+                                "FGRS","LTFH++","LTPA"))+
+scale_x_discrete(guide = guide_axis(angle = 90),label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])))+
+theme( panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(), 
+       #axis.line = element_line(colour = "black",size = 0.2),
+       strip.background = element_rect(fill="white",linetype = "solid"),
+       legend.position = "none")
+g
+
+
+
+
+
+```
+
+
+```{r generative_50, fig.height=3,fig.width=4}
+g <- ggplot(dt[FU=="incomplete"&aoo_l_cor==0.5&method!="gibbs"],
+            aes(x=method_f,y=mean, color=method))+
+  geom_point()+
+  geom_errorbar(aes(ymin=mean-1.96*se,ymax=mean+1.96*se),width=.01)+
+  labs(x="",y= expression(R[l]^2),color="Method")+
+  theme_bw()+ 
+   facet_wrap(~ifelse(aoo_l_cor==0,"Sim: Random AOO",
+                      ifelse(aoo_l_cor==0.5,"Sim: cor(AOO,Liability)=0.50",
+                             "Sim: Age-depend. thresh.")))+
+  expand_limits(ymin=0)+ 
+  scale_color_manual(values=c("FGRS"="#000000", "LTPA"="#E69F00", 
+                              "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                              "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                              "gibbsF90"="gray","LTFH++"="purple"),
+                      label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                      breaks = c("PA-FGRS","gibbs","PA-FGRS_adt","PA","gibbsF90",
+                                "FGRS","LTFH++","LTPA"))+
+scale_x_discrete(guide = guide_axis(angle = 90),label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])))+
+theme( panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(), 
+       #axis.line = element_line(colour = "black",size = 0.2),
+       strip.background = element_rect(fill="white",linetype = "solid"))
+g
+
+
+```
+
+
+```{r generative_completeFU, fig.height=3,fig.width=8}
+g <- ggplot(dt[FU=="complete"&method!="gibbs"],
+            aes(x=method_f,y=mean, color=method))+
+  geom_point()+
+  geom_errorbar(aes(ymin=mean-1.96*se,ymax=mean+1.96*se),width=.01)+
+  labs(x="",y= expression(R[l]^2),color="Method")+
+  theme_bw()+ 
+  facet_wrap(~ifelse(aoo_l_cor==0,"Sim: Random AOO",
+                     ifelse(aoo_l_cor==0.5,
+                            "Sim: cor(AOO,Liability)=0.50",
+                            "Sim: Age-depend. thresh.")))+
+  expand_limits(ymin=0)+ 
+  scale_color_manual(values= c("FGRS"="#000000", "LTPA"="#E69F00", 
+                               "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                               "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                               "gibbsF90"="gray","LTFH++"="purple"),
+                      label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                      breaks = c("PA-FGRS","gibbs","PA-FGRS_adt","PA","gibbsF90",
+                                "FGRS","LTFH++","LTPA"))+
+scale_x_discrete(guide = guide_axis(angle = 90),label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])))+
+theme( panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(), 
+       strip.background = element_rect(fill="white",linetype = "solid"))
+g
+
+
+```
+
+```{r calib_main,fig.height=3,fig.width=4}
+
+dt <- Reduce('rbind',lapply(c("complete","incomplete"), function(FU) {  
+Reduce('rbind',lapply(1:3, function(i){
+aoo_l_cor=c(1,0,.5)[i]
+model=c("aoo1","aoo0","aoo5")[i]
+sims_i <- get(load(paste0("~/Methods_MDD_sims/tmp/model_",
+                          model,"_FU",FU,"240227.Rdata")))  
+colnames(sims_i[[1]])
+library(abind)
+unfailed <- sapply(sims_i, is.data.frame)
+cors = lapply(sims_i[unfailed],function(x) {
+  x$fgrs <- scale(x$fgrs)
+  x$solution <- x$solution/sqrt(2)
+
+  sapply(c(1,56:57,59:64),function(y) coef(lm(x[,1]~0+x[,y]))[1])
+  })
+m_cor = apply(do.call('rbind',cors),2,mean)
+se_cor = apply(do.call('rbind',cors),2,sd)/sqrt(length(cors))
+dt= data.table(names(m_cor)[-1],mean=m_cor[-1],se=se_cor[-1])
+dt$method = c("FGRS","PA-FGRS",
+              "PA","LTPA","gibbs","LTFH++","gibbsF90","PA-FGRS_adt")
+dt$aoo_l_cor <- aoo_l_cor
+dt$FU <- FU
+dt}))}))
+
+dt$method_f <- factor(dt$method,levels = c("PA-FGRS","gibbs","PA-FGRS_adt",
+                                           "PA","gibbsF90","FGRS",
+                                           "LTFH++","LTPA"))
+g <- ggplot(dt[FU=="incomplete"&!aoo_l_cor==0.5&method!="gibbs"],
+            aes(x=method_f,y=mean, color=method))+
+  geom_abline(intercept = 1,slope = 0,linetype="dashed")+    
+  geom_point()+
+  geom_errorbar(aes(ymin=mean-1.96*se,ymax=mean+1.96*se),width=.01)+
+  labs(x="",y= "Regression slope",color="Method")+
+  theme_bw()+  
+  facet_wrap(~ifelse(aoo_l_cor==0,
+                     "Sim: Random AOO",
+                     ifelse(aoo_l_cor==0.5,
+                            "Sim: cor(AOO,Liability)=0.50",
+                            "Sim: Age-depend. thresh.")))+
+  expand_limits(ymin=0)+
+
+  scale_color_manual(values=c("FGRS"="#000000", "LTPA"="#E69F00", 
+                              "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                              "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                              "gibbsF90"="gray","LTFH++"="purple"),
+                      label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                     breaks = c("PA-FGRS","gibbs","PA-FGRS_adt",
+                                "PA","gibbsF90","FGRS","LTFH++","LTPA"))+
+  scale_x_discrete(guide = guide_axis(angle = 90),label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])))+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        strip.background = element_rect(fill="white",linetype = "solid"),
+        legend.position = "none")
+g
+
+```
+
+```{r,eval=F,include=F}
+#Plot LTFH++
+sims_i <- get(load("~/Methods_MDD_sims/tmp/model_aoo0_FUincomplete240221.Rdata"))
+unfailed <- sapply(sims_i, is.data.frame)
+dt_Sims <- data.table(Reduce('rbind',sims_i[unfailed]))
+dt_Sims[,mean(pa,na.rm=T)]
+dt_Sims[,cut:=cut(pa,quantile(pa,na.rm=T,seq(0,1,length.out=11)))]
+dt_Sims[,cut_pa:=mean(pa),cut]
+dt_sum=dt_Sims[,.(m_t=mean(true_liab.z1),
+                  se_t=sd(true_liab.z1)/sqrt(.N),
+                  m_e=mean(pa),
+                  se_e=sd(pa)/sqrt(.N)),cut]
+dt_Sims[,qplot(y=cut_true,x=cut_pa)]+geom_abline(slope = 1,intercept = 0)
+ggplot(data=dt_sum,aes(x=m_e,y=m_t,ymin=m_t-se_t*1.96,ymax=m_t+se_t*1.96))+
+  geom_pointrange()+
+  geom_abline(slope = 1,intercept = 0)
+
+```
+
+
+```{r calib50,fig.height=3,fig.width=4}
+g <- ggplot(dt[FU=="incomplete"&aoo_l_cor==0.5&method!="gibbs"],
+            aes(x=method_f,y=mean, color=method))+
+  geom_point()+
+  geom_errorbar(aes(ymin=mean-1.96*se,ymax=mean+1.96*se),width=.01)+
+  labs(x="",y= "Regression slope",color="Method")+
+  theme_bw()+  
+  facet_wrap(~ifelse(aoo_l_cor==0,
+                     "Sim: Random AOO",
+                     ifelse(aoo_l_cor==0.5,
+                            "Sim: cor(AOO,Liability)=0.50",
+                            "Sim: Age-depend. thresh.")))+
+  expand_limits(ymin=0)+
+  geom_abline(intercept = 1,slope = 0,linetype="dashed")+    
+  scale_color_manual(values=c("FGRS"="#000000", "LTPA"="#E69F00", 
+                              "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                              "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                              "gibbsF90"="gray","LTFH++"="purple"),
+                      label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                     breaks = c("PA-FGRS","gibbs","PA-FGRS_adt",
+                                "PA","gibbsF90",
+                                "FGRS","LTFH++","LTPA"))+
+scale_x_discrete(guide = guide_axis(angle = 90),label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])))+
+theme( panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(), 
+       strip.background = element_rect(fill="white",linetype = "solid"))
+g
+
+```
+
+```{r calib_completeFU,fig.height=4,fig.width=8}
+g <- ggplot(dt[FU=="complete"&method!="gibbs"],aes(x=method_f,y=mean, color=method))+
+  geom_point()+
+  geom_errorbar(aes(ymin=mean-1.96*se,ymax=mean+1.96*se),width=.01)+
+  labs(x="",y= "Regression slope",color="Method")+
+  theme_bw()+  
+  facet_wrap(~ifelse(aoo_l_cor==0,
+                     "Sim: Random AOO",
+                     ifelse(aoo_l_cor==0.5,
+                            "Sim: cor(AOO,Liability)=0.50",
+                            "Sim: Age-depend. thresh.")))+
+  expand_limits(ymin=0)+
+  geom_abline(intercept = 1,slope = 0,linetype="dashed")+    
+  scale_color_manual(values=c("FGRS"="#000000", "LTPA"="#E69F00", 
+                              "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                              "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                              "gibbsF90"="gray","LTFH++"="purple"),
+                      label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                     breaks = c("PA-FGRS","gibbs","PA-FGRS_adt","PA","gibbsF90",
+                                "FGRS","LTFH++","LTPA"))+
+scale_x_discrete(guide = guide_axis(angle = 90),label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])))+
+theme( panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(), 
+       strip.background = element_rect(fill="white",linetype = "solid"))
+g
+
+```
+
+
+
+```{r prevs, fig.height=3,fig.width=4}
+
+dt <- Reduce('rbind',lapply(seq(.01,.25,length.out=7), function(prev) {  
+aoo_l_cor=c(1,0,.5)[2]
+model=c("aoo1","aoo0","aoo5")[2]
+sims_i <- get(load(paste0("~/Methods_MDD_sims/tmp/prev_",prev,".Rdata")))  
+colnames(sims_i[[1]])
+library(abind)
+unfailed <- sapply(sims_i, is.data.frame)
+unfailed <- sapply(sims_i, is.data.frame)
+cors = lapply(sims_i[unfailed],function(x) cor(x[,c(1,56:63)],use="complete")^2)
+m_cor = apply(do.call('abind',list(cors,along=3)),1:2,mean)
+
+se_cor = apply(do.call('abind',list(cors,along=3)),1:2,sd)/sqrt(length(cors))
+dt= data.table(rownames(m_cor)[-1],mean=m_cor[-1,1],se=se_cor[-1,1])
+dt$method = c("FGRS","PA-FGRS","PA-FGRS_adt","PA",
+              "LTPA","gibbs","LTFH++","gibbsF90")
+dt$aoo_l_cor <- aoo_l_cor
+dt$FU <- "incomplete"
+dt$prev=prev
+dt}))
+
+h2=0.5
+dt$method_f <- factor(dt$method,levels = 
+                        c("PA-FGRS","gibbs","PA-FGRS_adt",
+                          "PA","gibbsF90","FGRS","LTFH++","LTPA"))
+g1 <- ggplot(dt[FU=="incomplete"&!method%in% c("gibbs")
+                ],aes(x=prev,y=mean*h2, color=method))+
+  geom_errorbar(aes(ymin=mean*h2-se,ymax=mean*h2+se),width=.01)+
+  geom_point()+geom_line()+
+  labs(x="Prevalence",y= expression(R[l]^2),color="Method")+
+  theme_bw()+ expand_limits(ymin=0)
+g1 <- g1+ scale_color_manual(values=c("FGRS"="#000000", "LTPA"="#E69F00", 
+                                      "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                                      "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                                      "gibbsF90"="gray","LTFH++"="purple"),
+                              label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                             breaks = c("PA-FGRS","gibbs","PA-FGRS_adt",
+                                        "PA","gibbsF90","FGRS","LTFH++","LTPA"))
+g1+theme(panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+```
+
+
+```{r prevs_adt, fig.height=3,fig.width=4}
+
+dt <- Reduce('rbind',lapply(seq(.01,.25,length.out=7), function(prev) {  
+aoo_l_cor=c(1,0,.5)[2]
+model=c("aoo1","aoo0","aoo5")[2]
+sims_i <- get(load(paste0("~/Methods_MDD_sims240212/tmp/prev_",prev,"_adt.240227.Rdata")))  
+colnames(sims_i[[1]])
+library(abind)
+unfailed <- sapply(sims_i, is.data.frame)
+unfailed <- sapply(sims_i, is.data.frame)
+cors = lapply(sims_i[unfailed],function(x) cor(x[,c(1,56:63)],use="complete")^2)
+m_cor = apply(do.call('abind',list(cors,along=3)),1:2,mean)
+
+se_cor = apply(do.call('abind',list(cors,along=3)),1:2,sd)/sqrt(length(cors))
+dt= data.table(rownames(m_cor)[-1],mean=m_cor[-1,1],se=se_cor[-1,1])
+dt$method = c("FGRS","PA-FGRS","PA-FGRS_adt","PA",
+              "LTPA","gibbs","LTFH++","gibbsF90")
+dt$aoo_l_cor <- aoo_l_cor
+dt$FU <- "incomplete"
+dt$prev=prev
+dt}))
+
+h2=0.5
+dt$method_f <- factor(dt$method,levels = 
+                        c("PA-FGRS","gibbs","PA-FGRS_adt",
+                          "PA","gibbsF90","FGRS","LTFH++","LTPA"))
+g1 <- ggplot(dt[FU=="incomplete"&!method%in% c("gibbs")
+                ],aes(x=prev,y=mean*h2, color=method))+
+  geom_errorbar(aes(ymin=mean*h2-se,ymax=mean*h2+se),width=.01)+
+  geom_point()+geom_line()+
+  labs(x="Prevalence",y= expression(R[l]^2),color="Method")+
+  theme_bw()+ expand_limits(ymin=0)
+g1 <- g1+ scale_color_manual(values=c("FGRS"="#000000", "LTPA"="#E69F00", 
+                                      "PA"="#56B4E9","PA-FGRS"= "#009E73",
+                                      "PA-FGRS_adt"="lightgreen","gibbs"="gray",
+                                      "gibbsF90"="gray","LTFH++"="purple"),
+                              label=c("PA-FGRS_adt"=bquote("PA-FGRS"[adt])),
+                             breaks = c("PA-FGRS","gibbs","PA-FGRS_adt",
+                                        "PA","gibbsF90","FGRS","LTFH++","LTPA"))
+g1+theme(panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+```
+```{r}
+library(corrplot)
+emp_cor <-as.matrix(round(fread("~/export240126/meth_comp_corr.csv"),3))
+rownames(emp_cor) <- colnames(emp_cor) <- 
+  c("gibbsF90","FGRS","FGRS_unadj","$'PA-FGRS'['adt']","PA",
+    "LTFH++","LTFH","$'PA-FGRS'['fdr']","PA-FGRS")
+corrplot(emp_cor[-3,-3],method = "number",number.digits = 3,diag = F,
+         col.lim = c(.7,1),
+         col =colorRampPalette(c(rep("#FFFFFF",20), "#67001F","#B2182B", 
+                                   "#2166AC", "#053061"))(500),
+         cl.pos = 'n',tl.col = "black",hclust.method = "ward.D2",
+         is.corr = T,order = "hclust",addrect = 3)
+
+```
+
+
+
+
+
